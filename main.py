@@ -18,7 +18,7 @@ from deps_installer import (
     missing_components,
     optional_components,
 )
-from clip_engine import ClipRunner, ClipUrlJob
+from clip_engine import ClipLocalJob, ClipRunner, ClipUrlJob
 from clip_page import ClipPage
 from engine import (
     DownloadCancelled,
@@ -242,6 +242,7 @@ class YouTubeDownloaderApp(tk.Tk):
         self._open_folder_btn.configure(text=t("options.open_folder"))
         self._cookies_lbl.configure(text=t("options.cookies"))
         self._cookies_pick_btn.configure(text=t("options.cookies_pick"))
+        self._cookies_hint.configure(text=t("options.cookies_hint"))
         self.download_btn.configure(text=t("action.download"))
         self.cancel_btn.configure(text=t("action.cancel"))
         if self.status_var.get() in (
@@ -484,6 +485,18 @@ class YouTubeDownloaderApp(tk.Tk):
         cookie_field.pack(side="left", fill="x", expand=True, padx=8)
         self._cookies_pick_btn = ghost_button(row3, t("options.cookies_pick"), self._choose_cookie)
         self._cookies_pick_btn.pack(side="left")
+
+        self._cookies_hint = tk.Label(
+            self._options_card.content,
+            text=t("options.cookies_hint"),
+            anchor="w",
+            justify="left",
+            bg=C["surface"],
+            fg=C["text_secondary"],
+            font=(ui_font_family(), 9),
+            wraplength=820,
+        )
+        self._cookies_hint.pack(fill="x", padx=4, pady=(0, 2))
 
         action = ttk.Frame(bottom_section)
         action.pack(fill="x", padx=12, pady=(6, 2))
@@ -1470,6 +1483,88 @@ class YouTubeDownloaderApp(tk.Tk):
 
     def _install_dependencies(self, include_node: bool = True) -> None:
         self._install_all()
+
+    def start_local_clip_jobs(self, jobs: list[ClipLocalJob]) -> None:
+        if self._worker and self._worker.is_alive():
+            return
+
+        if not self._env.ffmpeg_available:
+            if messagebox.askyesno(
+                t("msg.missing.title"),
+                t("msg.missing.body", items="ffmpeg"),
+            ):
+                self._install_all()
+            return
+
+        output_dir = self._clip_dir_from_ui()
+        if output_dir is None:
+            messagebox.showwarning(
+                t("msg.dir.bad_title"),
+                t("clip.dir.need_pick"),
+                parent=self,
+            )
+            return
+        try:
+            output_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            messagebox.showerror(
+                t("msg.dir.bad_title"),
+                t("msg.dir.mkdir_fail", path=output_dir, err=exc),
+                parent=self,
+            )
+            return
+
+        self._save_config()
+        self._cancel_flag = False
+        self._set_busy(True)
+        self._set_progress_value(0)
+        self.status_var.set(t("status.clipping"))
+        self._select_log_tab()
+        self._clear_log()
+        self._append_log(t("log.clip.local.start"))
+        self._append_log(t("log.clip.dir", dir=output_dir))
+        self._flush_ui_queues()
+
+        def worker() -> None:
+            runner = ClipRunner(
+                log=self._append_log,
+                status=self._set_status,
+                cancel_check=lambda: self._cancel_flag,
+            )
+            try:
+                ok, failed = runner.run_local(jobs, output_dir)
+                summary = t("log.clip.done", summary=f"{ok} ok, {failed} failed")
+                self._append_log(summary)
+                self.after(
+                    0,
+                    lambda s=summary, folder=output_dir: messagebox.showinfo(
+                        t("msg.clip.done_title"),
+                        f"{s}\n{folder}",
+                    ),
+                )
+            except DownloadCancelled:
+                self._append_log(t("log.clip.cancelled"))
+                self.after(0, lambda: self.status_var.set(t("status.cancelled")))
+            except Exception as exc:
+                self._append_log(t("log.install.fail", err=str(exc)))
+                self.after(
+                    0,
+                    lambda: messagebox.showerror(
+                        t("update.fail_title"),
+                        str(exc),
+                        parent=self,
+                    ),
+                )
+            finally:
+
+                def _finish_clip() -> None:
+                    self._flush_ui_queues()
+                    self._set_busy(False)
+
+                self.after(0, _finish_clip)
+
+        self._worker = threading.Thread(target=worker, daemon=True)
+        self._worker.start()
 
     def start_clip_jobs(self, jobs: list[ClipUrlJob]) -> None:
         if self._worker and self._worker.is_alive():

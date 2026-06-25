@@ -76,6 +76,21 @@ class ClipUrlJob:
     segments: list[ClipSegment]
 
 
+@dataclass(frozen=True)
+class ClipLocalJob:
+    source_path: Path
+    segments: list[ClipSegment]
+
+
+LOCAL_VIDEO_EXTENSIONS = frozenset(
+    {".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v", ".flv", ".ts", ".wmv", ".mpeg", ".mpg"}
+)
+
+
+def is_local_video_file(path: Path) -> bool:
+    return path.suffix.lower() in LOCAL_VIDEO_EXTENSIONS
+
+
 def seconds_from_hms(hours: str, minutes: str, seconds: str) -> float:
     """Build duration in seconds from hour/minute/second fields."""
 
@@ -604,6 +619,184 @@ class ClipRunner:
 
         return hook
 
+    def _execute_segment_clips(
+        self,
+        *,
+        source: Path,
+        title: str,
+        segments: list[ClipSegment],
+        clips_dir: Path,
+        source_duration: Optional[float],
+        ffmpeg_exe: Path,
+        total_segments: int,
+        completed_units: float,
+        total_units: int,
+        done_segments: int,
+    ) -> tuple[int, int, float, int]:
+        """Trim all segments for one source file. Returns succeeded, failed, units, done count."""
+        succeeded = 0
+        failed = 0
+        for seg_index, segment in enumerate(segments, start=1):
+            if self._cancel_check():
+                raise DownloadCancelled()
+
+            start_label = format_timecode(segment.start).replace(":", "-")
+            end_label = format_timecode(segment.end).replace(":", "-")
+            folder_name = f"{title}_part{seg_index}_{start_label}_to_{end_label}"
+            segment_dir = clips_dir / folder_name
+            output_path = segment_dir / f"{folder_name}.mp4"
+
+            clip_start = segment.start
+            clip_end = segment.end
+            if source_duration is not None:
+                if clip_start >= source_duration:
+                    failed += 1
+                    done_segments += 1
+                    completed_units += 1.0
+                    self._log(
+                        f"剪辑失败: 起点 {format_timecode(clip_start)} 超出视频时长 "
+                        f"{format_timecode(source_duration)}"
+                    )
+                    self._report_overall(
+                        completed_units,
+                        total_units,
+                        f"已完成 {done_segments}/{total_segments} 段",
+                    )
+                    continue
+                if clip_end > source_duration:
+                    self._log(
+                        f"提示: 终点超出视频时长，已截断为 "
+                        f"{format_timecode(source_duration)}"
+                    )
+                    clip_end = source_duration
+
+            clip_duration = clip_end - clip_start
+            seg_no = done_segments + 1
+            self._report_overall(
+                completed_units,
+                total_units,
+                f"剪辑 {seg_no}/{total_segments} "
+                f"{format_timecode(clip_start)}–{format_timecode(clip_end)}",
+            )
+            self._log(
+                f"剪辑 [{seg_no}/{total_segments}]: "
+                f"{format_timecode(clip_start)} → {format_timecode(clip_end)} "
+                f"（时长 {format_timecode(clip_duration)} / {clip_duration:.0f} 秒）"
+            )
+
+            try:
+                out_seconds = ffmpeg_trim(
+                    source,
+                    clip_start,
+                    clip_end,
+                    output_path,
+                    ffmpeg_exe=ffmpeg_exe,
+                    log=self._log,
+                )
+                succeeded += 1
+                self._log(f"已保存: {output_path}（约 {out_seconds:.1f} 秒）")
+            except Exception as exc:
+                failed += 1
+                _remove_dir_if_empty(segment_dir)
+                self._log(f"剪辑失败: {exc}")
+            finally:
+                done_segments += 1
+                completed_units += 1.0
+                self._report_overall(
+                    completed_units,
+                    total_units,
+                    f"已完成 {done_segments}/{total_segments} 段",
+                )
+        return succeeded, failed, completed_units, done_segments
+
+    def run_local(
+        self,
+        jobs: Iterable[ClipLocalJob],
+        output_dir: Path,
+    ) -> tuple[int, int]:
+        """Clip local video files. Return ``(successful_clips, failed_clips)``."""
+        env = inspect_environment(output_dir)
+        if not env.ffmpeg_available:
+            raise RuntimeError("ffmpeg is required for clipping")
+
+        ffmpeg_exe = find_ffmpeg_executable()
+        if ffmpeg_exe is None:
+            raise RuntimeError("ffmpeg not found")
+        ffprobe_exe = find_ffprobe_executable()
+
+        job_list = list(jobs)
+        if not job_list:
+            raise ValueError("no clip jobs")
+
+        clips_dir = output_dir
+        clips_dir.mkdir(parents=True, exist_ok=True)
+
+        total_segments = sum(len(job.segments) for job in job_list)
+        job_count = len(job_list)
+        total_units = max(1, total_segments)
+        completed_units = 0.0
+        done_segments = 0
+        failed = 0
+        succeeded = 0
+
+        self._report_overall(0.0, total_units, "准备中…")
+
+        for job_index, job in enumerate(job_list, start=1):
+            if self._cancel_check():
+                raise DownloadCancelled()
+
+            source = job.source_path.resolve()
+            if not source.is_file():
+                self._log(f"[{job_index}/{job_count}] 文件不存在: {source}")
+                failed += len(job.segments)
+                done_segments += len(job.segments)
+                completed_units += len(job.segments)
+                continue
+            if not is_local_video_file(source):
+                self._log(
+                    f"[{job_index}/{job_count}] 不支持的格式: {source.name}"
+                )
+                failed += len(job.segments)
+                done_segments += len(job.segments)
+                completed_units += len(job.segments)
+                continue
+
+            title = _sanitize_filename(source.stem)
+            self._log(f"[{job_index}/{job_count}] 本地视频: {source.name}")
+            source_duration = probe_source_duration(
+                source,
+                ffmpeg_exe=ffmpeg_exe,
+                ffprobe_exe=ffprobe_exe,
+            )
+            if source_duration is not None:
+                self._log(
+                    f"源视频时长: {format_timecode(source_duration)} "
+                    f"（{source_duration:.0f} 秒）"
+                )
+
+            seg_ok, seg_fail, completed_units, done_segments = (
+                self._execute_segment_clips(
+                    source=source,
+                    title=title,
+                    segments=job.segments,
+                    clips_dir=clips_dir,
+                    source_duration=source_duration,
+                    ffmpeg_exe=ffmpeg_exe,
+                    total_segments=total_segments,
+                    completed_units=completed_units,
+                    total_units=total_units,
+                    done_segments=done_segments,
+                )
+            )
+            succeeded += seg_ok
+            failed += seg_fail
+
+        summary = f"剪辑完成: 成功 {succeeded}，失败 {failed}"
+        self._status(100.0, summary)
+        self._log(summary)
+        self._log(f"输出目录: {clips_dir}")
+        return succeeded, failed
+
     def run(
         self,
         jobs: Iterable[ClipUrlJob],
@@ -741,79 +934,22 @@ class ClipRunner:
                 completed_units = units_at_job_start + 1.0 + len(job.segments)
                 continue
 
-            for seg_index, segment in enumerate(job.segments, start=1):
-                if self._cancel_check():
-                    raise DownloadCancelled()
-
-                start_label = format_timecode(segment.start).replace(":", "-")
-                end_label = format_timecode(segment.end).replace(":", "-")
-                folder_name = f"{title}_part{seg_index}_{start_label}_to_{end_label}"
-                segment_dir = clips_dir / folder_name
-                output_path = segment_dir / f"{folder_name}.mp4"
-
-                clip_start = segment.start
-                clip_end = segment.end
-                if source_duration is not None:
-                    if clip_start >= source_duration:
-                        failed += 1
-                        done_segments += 1
-                        completed_units += 1.0
-                        self._log(
-                            f"剪辑失败: 起点 {format_timecode(clip_start)} 超出视频时长 "
-                            f"{format_timecode(source_duration)}"
-                        )
-                        self._report_overall(
-                            completed_units,
-                            total_units,
-                            f"已完成 {done_segments}/{total_segments} 段",
-                        )
-                        continue
-                    if clip_end > source_duration:
-                        self._log(
-                            f"提示: 终点超出视频时长，已截断为 "
-                            f"{format_timecode(source_duration)}"
-                        )
-                        clip_end = source_duration
-
-                clip_duration = clip_end - clip_start
-                seg_no = done_segments + 1
-                self._report_overall(
-                    completed_units,
-                    total_units,
-                    f"剪辑 {seg_no}/{total_segments} "
-                    f"{format_timecode(clip_start)}–{format_timecode(clip_end)}",
+            seg_ok, seg_fail, completed_units, done_segments = (
+                self._execute_segment_clips(
+                    source=source,
+                    title=title,
+                    segments=job.segments,
+                    clips_dir=clips_dir,
+                    source_duration=source_duration,
+                    ffmpeg_exe=ffmpeg_exe,
+                    total_segments=total_segments,
+                    completed_units=completed_units,
+                    total_units=total_units,
+                    done_segments=done_segments,
                 )
-                self._log(
-                    f"剪辑 [{seg_no}/{total_segments}]: "
-                    f"{format_timecode(clip_start)} → {format_timecode(clip_end)} "
-                    f"（时长 {format_timecode(clip_duration)} / {clip_duration:.0f} 秒）"
-                )
-
-                try:
-                    out_seconds = ffmpeg_trim(
-                        source,
-                        clip_start,
-                        clip_end,
-                        output_path,
-                        ffmpeg_exe=ffmpeg_exe,
-                        log=self._log,
-                    )
-                    succeeded += 1
-                    self._log(
-                        f"已保存: {output_path}（约 {out_seconds:.1f} 秒）"
-                    )
-                except Exception as exc:
-                    failed += 1
-                    _remove_dir_if_empty(segment_dir)
-                    self._log(f"剪辑失败: {exc}")
-                finally:
-                    done_segments += 1
-                    completed_units += 1.0
-                    self._report_overall(
-                        completed_units,
-                        total_units,
-                        f"已完成 {done_segments}/{total_segments} 段",
-                    )
+            )
+            succeeded += seg_ok
+            failed += seg_fail
 
         summary = f"剪辑完成: 成功 {succeeded}，失败 {failed}"
         self._status(100.0, summary)

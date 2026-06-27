@@ -13,6 +13,7 @@ from dedupe import (
     classify_url,
     collect_existing_video_ids,
     make_skip_filter,
+    record_downloaded_id,
     url_kind_label,
 )
 from paths_config import (
@@ -303,10 +304,25 @@ def build_ydl_options(
         "format": build_format_selector(format_key),
         "restrictfilenames": False,
         "nocheckcertificate": False,
+        "extractor_args": {
+            "youtube": {
+                "player_client": [
+                    "default",
+                    "tv",
+                    "web_safari",
+                ],
+            }
+        },
     }
 
     if existing_ids is not None and skip_log is not None and skipped_counter is not None:
-        opts["match_filter"] = make_skip_filter(existing_ids, skip_log, skipped_counter)
+        opts["match_filter"] = make_skip_filter(
+            existing_ids,
+            skip_log,
+            skipped_counter,
+            directory=output_dir,
+            url_kind=url_kind,
+        )
 
     js_runtimes = build_js_runtimes_dict()
     if js_runtimes:
@@ -341,6 +357,43 @@ class DownloadCancelled(Exception):
     pass
 
 
+def explain_download_error(message: str) -> Optional[str]:
+    """Map a yt-dlp error string to actionable Chinese guidance, if recognized."""
+    low = message.lower()
+    if "sign in to confirm" in low or "not a bot" in low or "confirm you" in low:
+        return (
+            "YouTube 要求验证身份（防机器人）。请在浏览器登录后导出 cookies.txt，"
+            "用「Cookies 文件」右侧的「选择文件…」选中它再下载。"
+        )
+    if "private video" in low or "this video is private" in low:
+        return (
+            "这是私享视频，必须用「有权限观看该视频的账号」导出的 cookies.txt 才能下载。"
+        )
+    if "members-only" in low or "members only" in low or "join this channel" in low:
+        return (
+            "这是会员专属视频。请用已加入该频道会员的账号导出 cookies.txt 后再下载。"
+        )
+    if "login required" in low or "requires login" in low or "account" in low and "cookies" in low:
+        return (
+            "该视频需要登录。请导出浏览器 cookies.txt，用「选择文件…」选中后再下载。"
+        )
+    if "age" in low and ("restrict" in low or "confirm" in low):
+        return (
+            "这是年龄限制视频。请用已登录且已确认年龄的账号导出 cookies.txt 后再下载。"
+        )
+    if "video unavailable" in low or "not available" in low:
+        return (
+            "视频不可用：可能是地区限制、已被删除/设为私有，或需要登录。"
+            "若你在浏览器能正常播放，请导出该账号的 cookies.txt 后再试。"
+        )
+    if "unable to extract" in low or "unable to download webpage" in low or "http error 403" in low:
+        return (
+            "解析失败，通常是 yt-dlp 版本过旧。请点「一键安装依赖」更新 yt-dlp 后重试；"
+            "若仍失败，请导出 cookies.txt 再试。"
+        )
+    return None
+
+
 class Downloader:
     def __init__(
         self,
@@ -353,6 +406,7 @@ class Downloader:
         self._status = status
         self._cancel_check = cancel_check
         self._current_title = ""
+        self._record_dir: Optional[Path] = None
 
     def _hook(self, data: dict) -> None:
         if self._cancel_check():
@@ -370,6 +424,9 @@ class Downloader:
         elif status == "finished":
             filename = data.get("filename") or ""
             self._log(f"已完成: {filename}")
+            if self._record_dir is not None:
+                info = data.get("info_dict") or {}
+                record_downloaded_id(self._record_dir, info.get("id"))
 
     def download_urls(
         self,
@@ -392,6 +449,8 @@ class Downloader:
         url_list = list(urls)
         if not url_list:
             raise ValueError("请先输入至少一个 YouTube 链接。")
+
+        self._record_dir = output_dir
 
         env = inspect_environment(output_dir)
         if format_key != "audio" and not env.ffmpeg_available:
@@ -494,6 +553,9 @@ class Downloader:
             except Exception as exc:
                 failed += 1
                 self._log(f"失败: {url}\n  原因: {exc}")
+                hint = explain_download_error(str(exc))
+                if hint:
+                    self._log(f"  解决建议: {hint}")
 
         summary = "全部完成"
         if failed:
